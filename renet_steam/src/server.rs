@@ -2,9 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use renet::{ClientId, RenetServer};
 use steamworks::{
+    networking_messages,
     networking_sockets::{InvalidHandle, ListenSocket, NetConnection},
     networking_types::{ListenSocketEvent, NetConnectionEnd, NetworkingConfigEntry, SendFlags},
-    Client, ClientManager, FriendFlags, Friends, LobbyId, Manager, Matchmaking, SteamId,
+    networking_utils::NetworkingUtils,
+    Client, FriendFlags, Friends, LobbyId, Matchmaking, SteamId,
 };
 
 use super::MAX_MESSAGE_BATCH_SIZE;
@@ -28,26 +30,33 @@ pub struct SteamServerConfig {
 }
 
 #[cfg_attr(feature = "bevy", derive(bevy_ecs::resource::Resource))]
-pub struct SteamServerTransport<Manager = ClientManager> {
-    listen_socket: ListenSocket<Manager>,
-    matchmaking: Matchmaking<Manager>,
-    friends: Friends<Manager>,
+pub struct SteamServerTransport {
+    listen_socket: ListenSocket,
+    networking_utils: NetworkingUtils,
+    matchmaking: Matchmaking,
+    friends: Friends,
     max_clients: usize,
     access_permission: AccessPermission,
-    connections: HashMap<ClientId, NetConnection<Manager>>,
+    connections: HashMap<ClientId, NetConnection>,
 }
 
-impl<T: Manager + 'static> SteamServerTransport<T> {
-    pub fn new(client: &Client<T>, config: SteamServerConfig) -> Result<Self, InvalidHandle> {
+// It's so fine
+unsafe impl Send for SteamServerTransport {}
+unsafe impl Sync for SteamServerTransport {}
+
+impl SteamServerTransport {
+    pub fn new(client: &Client, config: SteamServerConfig) -> Result<Self, InvalidHandle> {
         let options: Vec<NetworkingConfigEntry> = Vec::new();
         let listen_socket = client.networking_sockets().create_listen_socket_p2p(0, options)?;
         let matchmaking = client.matchmaking();
         let friends = client.friends();
+        let networking_utils = client.networking_utils();
 
         Ok(Self {
             listen_socket,
             matchmaking,
             friends,
+            networking_utils,
             max_clients: config.max_clients,
             access_permission: config.access_permission,
             connections: HashMap::new(),
@@ -67,7 +76,7 @@ impl<T: Manager + 'static> SteamServerTransport<T> {
     /// Disconnects a client from the server.
     pub fn disconnect_client(&mut self, client_id: ClientId, server: &mut RenetServer, flush_last_packets: bool) {
         if let Some((_key, value)) = self.connections.remove_entry(&client_id) {
-            let _ = value.close(NetConnectionEnd::AppGeneric, Some("Client was kicked"), flush_last_packets);
+            let _ = value.close(NetConnectionEnd::MiscGeneric, Some("Client was kicked"), flush_last_packets);
         }
         server.remove_connection(client_id);
     }
@@ -77,7 +86,7 @@ impl<T: Manager + 'static> SteamServerTransport<T> {
         let keys = self.connections.keys().cloned().collect::<Vec<ClientId>>();
         for client_id in keys {
             let _ = self.connections.remove_entry(&client_id).unwrap().1.close(
-                NetConnectionEnd::AppGeneric,
+                NetConnectionEnd::MiscGeneric,
                 Some("Client was kicked"),
                 flush_last_packets,
             );
@@ -103,12 +112,12 @@ impl<T: Manager + 'static> SteamServerTransport<T> {
                 }
                 ListenSocketEvent::Connecting(event) => {
                     if server.connected_clients() >= self.max_clients {
-                        event.reject(NetConnectionEnd::AppGeneric, Some("Too many clients"));
+                        event.reject(NetConnectionEnd::MiscGeneric, Some("Too many clients"));
                         continue;
                     }
 
                     let Some(steam_id) = event.remote().steam_id() else {
-                        event.reject(NetConnectionEnd::AppGeneric, Some("Invalid steam id"));
+                        event.reject(NetConnectionEnd::MiscGeneric, Some("Invalid steam id"));
                         continue;
                     };
 
@@ -131,7 +140,7 @@ impl<T: Manager + 'static> SteamServerTransport<T> {
                             log::error!("Failed to accept connection from {steam_id:?}: {e}");
                         }
                     } else {
-                        event.reject(NetConnectionEnd::AppGeneric, Some("Not allowed"));
+                        event.reject(NetConnectionEnd::MiscGeneric, Some("Not allowed"));
                     }
                 }
             }
@@ -158,15 +167,18 @@ impl<T: Manager + 'static> SteamServerTransport<T> {
             };
             let packets = server.get_packets_to_send(client_id).unwrap();
             // TODO: while this works fine we should probaly use the send_messages function from the listen_socket
-            for packet in packets {
-                if let Err(e) = connection.send_message(&packet, SendFlags::UNRELIABLE) {
-                    log::error!("Failed to send packet to client {client_id}: {e}");
-                    continue 'clients;
-                }
-            }
+            println!("# packets to send: {}", packets.len());
 
-            if let Err(e) = connection.flush_messages() {
-                log::error!("Failed flush messages for {client_id}: {e}");
+            let messages_to_send = packets.into_iter().map(|data| {
+                let mut msg = self.networking_utils.allocate_message(data.len());
+                msg.copy_data_into_buffer(&data).expect("Failed to copy packet data into buffer!");
+                msg
+            });
+
+            let results = self.listen_socket.send_messages(messages_to_send);
+
+            for err in results.into_iter().flat_map(|x| x.err()) {
+                log::error!("Failed flush message for {client_id}: {err}");
             }
         }
     }
